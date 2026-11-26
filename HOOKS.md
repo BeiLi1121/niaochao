@@ -47,7 +47,7 @@ def on_session_end(who, task, answer, turns, living):
     """
     每跑完一轮调一次。返回要追加的文本，或 None 表示这次不值得记。
     """
-    return "2026-11-26 15:10 用户问了……我答了……"
+    return "2026-11-26 15:10 用户问……我答……"
 ```
 
 规则：
@@ -62,14 +62,14 @@ def on_session_end(who, task, answer, turns, living):
 
 ---
 
-## 验收（栖会这样跑）
+## 验收（作者会这样跑）
 
 ```bash
 # 1. 挂点能加载，不报错
 python3 -c "
-import sys; sys.path.insert(0, os.path.expanduser('~/living'))
+import sys, os;sys.path.insert(0,os.path.expanduser("~/living"))
 import runner
-m = runner.load_hook('zhi','persist')
+m = runner.load_hook('beta','persist')
 print('loaded:', m is not None)
 "
 
@@ -88,9 +88,42 @@ python3 ~/living/runner.py --who <who> --selftest
 
 | 挂点 | 谁 | 路径 |
 |---|---|---|
-| compress（共用） | 蛋蛋 | `hooks/_shared/compress.py` |
-| persist（枝自己的） | 枝 | `hooks/zhi/persist.py` |
-| persist（A 自己的） | A | `hooks/<who>/persist.py` |
-| persist（B 自己的） | B | `hooks/<who>/persist.py` |
+| compress（共用） | 全体 | `hooks/_shared/compress.py` |
+| persist（A 自己的） | A | `hooks/<a>/persist.py` |
+| persist（B 自己的） | B | `hooks/<b>/persist.py` |
+| persist（C 自己的） | C | `hooks/<c>/persist.py` |
 
-**三只谁都不许改 `runner.py`。** 需要主循环多一个调用点，先说，由栖改。
+**谁都不许改 `runner.py`。** 需要主循环多一个调用点，先提出来，由主循环作者改。
+
+---
+
+## 三、`tools.py` —— 给本体加自己的手和眼
+
+主循环自带三个工具（`run` / `recall` / `skill`）。**别的能力不要改 runner.py**，写 `hooks/<who>/tools.py` 挂上去。
+
+模块里要两样东西：
+
+```python
+TOOLS = [{                       # OpenAI 的 function schema 数组，原样塞进请求
+    "type": "function",
+    "function": {
+        "name": "body",
+        "description": "用身体做一件事",
+        "parameters": {"type": "object",
+                       "properties": {"verb": {"type": "string"}},
+                       "required": ["verb"]},
+    },
+}]
+
+
+def call(name, args):            # 主循环在模型要工具时调它
+    return {"exit_code": 0, "stdout": "说话内容", "stderr": ""}
+```
+
+三条规矩：
+
+1. **必须返回 `{"exit_code", "stdout", "stderr"}` 三个键**。`exit_code` 非 0 表示这次没成，`stderr` 写原因。
+2. **不许抛异常**。「我看不见」和「我看见一片黑」是两回事，都要能落到 `reason` 里回给模型，不能让主循环崩。
+3. **放 `hooks/_shared/tools.py` 三只共用**；哪只想不一样，就在自己的 `hooks/<who>/tools.py` 写一份盖掉。
+
+主循环只认自己那三个名字加你 `TOOLS` 里出现过的名字。别的名字一律回「没有工具」。

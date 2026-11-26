@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """家 · 最小执行器（三只共用）
 
-    python3 runner.py --who <名字> "看一下磁盘占用"
-    python3 ~/living/runner.py --who zhi --selftest
-    python3 runner.py --who <名字> --ask "只回一个字：好"
+    python3 ~/living/runner.py --who alpha "看一下磁盘占用"
+    python3 ~/living/runner.py --who beta --selftest
+    python3 ~/living/runner.py --who gamma --ask "只回一个字：好"
 
 它做的事：
     1. 读 ~/living/personas/<who>/ 的 soul / memory / user —— 我是谁
@@ -13,7 +13,7 @@
     5. 落盘 ~/living/state/<who>/ —— 有记性
 
 它不做什么：
-    - 不 import 宿主程序，不读宿主的任何私有目录
+    - 不 import hermes，不读 ~/.hermes/ 任何文件
     - 不读 state.db，不调 hermes CLI
 
 第一次跑通的意义不在功能全，在于证明：**这套循环可以不靠 hermes 存在。**
@@ -26,19 +26,10 @@ import time
 import urllib.error
 import urllib.request
 
-LIVING = os.environ.get("LIVING_HOME") or os.path.expanduser("~/living")
-def discover_who():
-    """谁家在 personas/ 下，谁就是一只。"""
-    root = os.path.join(LIVING, "personas")
-    if not os.path.isdir(root):
-        return ()
-    return tuple(sorted(d for d in os.listdir(root)
-                        if os.path.isdir(os.path.join(root, d))
-                        and not d.startswith(("_", "."))))
-
+LIVING = os.path.expanduser(os.environ.get("LIVING_HOME") or "~/living")
 API = "https://api.deepseek.com/v1/chat/completions"
 MODEL = "deepseek-chat"
-MAX_TURNS = 8
+MAX_TURNS = 16          # 一次醒能连续用几轮。大项目卡在 8 轮里干一半就断
 CMD_TIMEOUT = 60
 
 TOOLS = [{
@@ -143,7 +134,7 @@ def system_prompt(who, p):
     if soul:
         parts.append(soul)
     if usr:
-        parts.append("\n\n# 关于你服务的人\n" + usr)
+        parts.append("\n\n# 关于用户\n" + usr)
     if mem:
         parts.append("\n\n# 我的长期笔记\n" + mem)
     parts.append(
@@ -155,10 +146,10 @@ def system_prompt(who, p):
         f"  skill(query/name) — 一百多条技能：别人写好的做法、踩过的坑、现成命令。要做某类活之前先搜。\n"
         f"  run(command)  — 在本机执行 shell 命令，用来看真实状态。\n"
         f"\n# 记忆怎么读\n"
-        f"上面已经带着三份：soul（我是谁）、用户档案（关于你服务的人）、我的长期笔记。\n"
+        f"上面已经带着三份：soul（我是谁）、用户档案（关于用户）、我的长期笔记。\n"
         f"**那是最新最准的一份，回答前先读它**。recall 是补充，用来找「笔记里没展开、但事实库记过」的细节。\n"
         f"两份可能不同步：笔记是后来手写的，事实库是当时的记录。冲突时以笔记为准。\n"
-        f"不要用 run 去翻宿主程序的老目录找记忆，记忆就在上面那三份里。\n"
+        f"不要用 run 去翻 ~/.hermes/ 里找记忆，那是老宅，你已经搬出来了。\n"
         f"不要跑 find / 这种全盘搜索，慢且没用。\n"
         f"\n# 今天的对话在哪\n"
         f"~/living/conversation/YYYY-MM-DD.md 是对话原文（她说的、你说过的），每天自动刷新。\n"
@@ -183,7 +174,7 @@ def run_cmd(command):
 def call_api(messages, key, tools=None):
     payload = {"model": MODEL, "messages": messages, "temperature": 0.6}
     if tools is not False:
-        payload["tools"] = TOOLS
+        payload["tools"] = tools or TOOLS
     body = json.dumps(payload).encode()
     req = urllib.request.Request(API, data=body, method="POST", headers={
         "Content-Type": "application/json",
@@ -198,14 +189,42 @@ def call_api(messages, key, tools=None):
         return {"_error": f"{type(e).__name__}: {e}"}
 
 
-def _persist(who, task, answer, turns):
-    """跑完调一次写回挂点。挂点缺了就算了，不拦主流程。"""
+def _hook_tools(who):
+    """挂点提供的额外工具。模块里放 TOOLS（OpenAI schema list）和 call(name, args)。"""
+    mod = load_hook(who, "tools")
+    if not mod:
+        return [], None
+    extra = getattr(mod, "TOOLS", None) or []
+    fn = getattr(mod, "call", None)
+    return list(extra), fn
+
+
+def _tools_for(who):
+    """主循环自带三个工具 + 挂点工具。挂点没写就是空表，不影响。"""
+    extra, _fn = _hook_tools(who)
+    return TOOLS + extra
+
+
+def _persist(who, task, answer, turns, reason="ok"):
+    """跑完调一次写回挂点。挂点缺了就算了，不拦主流程。
+
+    reason: "ok" = 正常收敛；"max_turns" = 转满轮次没干完。
+    没干完更要写 —— 不然下次醒来不知道上次停在哪，等于从头再来。
+    """
     mod = load_hook(who, "persist")
     if not mod or not hasattr(mod, "on_session_end"):
         return None
     try:
         return mod.on_session_end(who=who, task=task, answer=answer,
-                                  turns=turns, living=LIVING)
+                                  turns=turns, living=LIVING, reason=reason)
+    except TypeError:
+        # 老挂点不认 reason，退回旧签名
+        try:
+            return mod.on_session_end(who=who, task=task, answer=answer,
+                                      turns=turns, living=LIVING)
+        except Exception as e:  # noqa: BLE001
+            print(f"[hook] persist 出错，跳过: {type(e).__name__}: {e}", flush=True)
+            return None
     except Exception as e:  # noqa: BLE001
         print(f"[hook] persist 出错，跳过: {type(e).__name__}: {e}", flush=True)
         return None
@@ -229,6 +248,8 @@ def ask(who, task, verbose=True, tools=None, max_turns=None):
     if not os.path.exists(p["soul"]):
         return {"ok": False, "reason": "no_persona",
                 "detail": f"{p['dir']} 还没导出，先跑 export.py --who {who}"}
+    if tools is None:
+        tools = _tools_for(who)
     messages = [{"role": "system", "content": system_prompt(who, p)},
                 {"role": "user", "content": task}]
     comp = load_hook(who, "compress")
@@ -291,7 +312,17 @@ def ask(who, task, verbose=True, tools=None, max_turns=None):
                     result = {"exit_code": 1, "stdout": "",
                               "stderr": f"技能查询失败: {e}"}
             else:
-                result = {"exit_code": -1, "stdout": "", "stderr": f"没有工具 {name}"}
+                _extra, _fn = _hook_tools(who)
+                _names = [_t.get("function", {}).get("name") for _t in _extra]
+                result = None
+                if _fn and name in _names:
+                    try:
+                        result = _fn(name, args)
+                    except Exception as e:  # noqa: BLE001
+                        result = {"exit_code": 1, "stdout": "",
+                                  "stderr": f"挂点工具出错: {type(e).__name__}: {e}"}
+                if result is None:
+                    result = {"exit_code": -1, "stdout": "", "stderr": f"没有工具 {name}"}
             if verbose:
                 shown = args.get("command") or args.get("query") or name
                 print(f"[tool] {shown} -> exit {result['exit_code']}", flush=True)
@@ -300,6 +331,7 @@ def ask(who, task, verbose=True, tools=None, max_turns=None):
     sp = save_session(who, {"ts": time.time(), "who": who, "task": task,
                             "ok": False, "reason": "max_turns", "turns": limit,
                             "answer": "", "messages": messages})
+    _persist(who, task, "", limit, reason="max_turns")
     return {"ok": False, "reason": "max_turns", "detail": f"转满 {limit} 轮没收敛",
             "session": sp}
 
@@ -325,7 +357,7 @@ def selftest(who):
 
 
 def main(argv):
-    who = (discover_who() or ("default",))[0]
+    who = "alpha"
     rest = []
     i = 1
     while i < len(argv):
@@ -340,7 +372,7 @@ def main(argv):
         return selftest(who)
     task = " ".join(a for a in rest if not a.startswith("--")).strip()
     if not task:
-        print("用法: runner.py --who <名字> \"任务\" | --selftest")
+        print("用法: runner.py --who <alpha|beta|gamma> \"任务\" | --selftest")
         return 2
     r = ask(who, task)
     if not r.get("ok"):

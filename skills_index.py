@@ -3,7 +3,7 @@
 
     python3 ~/living/skills_index.py --build           # 重建索引
     python3 ~/living/skills_index.py --search "量化"    # 找技能
-    python3 skills_index.py --read <技能名>  # 读全文
+    python3 ~/living/skills_index.py --read hermes-agent  # 读全文
 
 两百多条 description 全塞进上下文是浪费，所以只留索引，按需取全文。
 搜索先匹配名字和描述（快），匹配不到再全文 grep（慢但全）。
@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 
-LIVING = os.path.expanduser("~/living")
+LIVING = os.path.expanduser(os.environ.get("LIVING_HOME") or "~/living")
 SKILLS = os.path.join(LIVING, "skills")
 CATALOG = os.path.join(LIVING, "skills", "catalog.json")
 

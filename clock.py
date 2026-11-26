@@ -4,9 +4,9 @@
 一条链，不是定时器：每次醒来自己决定下一次什么时候醒。
 三只各用各的，状态、额度、待办、unit 名全部按 who 分开。
 
-    python3 clock.py --who <名字> --tick
-    python3 ~/living/clock.py --who zhi --status
-    python3 clock.py --who <名字> --stop
+    python3 ~/living/clock.py --who alpha --tick
+    python3 ~/living/clock.py --who beta --status
+    python3 ~/living/clock.py --who gamma --stop
     python3 ~/living/clock.py --watchdog        # 保险，一次看所有接过钟的
 
 三级醒：
@@ -23,23 +23,21 @@ import subprocess
 import sys
 import time
 
-LIVING = os.environ.get("LIVING_HOME") or os.path.expanduser("~/living")
+LIVING = os.path.expanduser(os.environ.get("LIVING_HOME") or "~/living")
 PY = "/usr/bin/python3"
 SELF = os.path.abspath(__file__)
 def discover_who():
-    """谁家在 personas/ 下，谁就是一只。加一只不用改代码，建个目录就行。"""
-    root = os.path.join(LIVING, "personas")
-    if not os.path.isdir(root):
+    """谁存在看 personas/ 目录，不写死名字 —— 拷到别的机器也能用。"""
+    d = os.path.join(LIVING, "personas")
+    try:
+        return tuple(sorted(n for n in os.listdir(d)
+                            if os.path.isdir(os.path.join(d, n))))
+    except OSError:
         return ()
-    return tuple(sorted(d for d in os.listdir(root)
-                        if os.path.isdir(os.path.join(root, d))
-                        and not d.startswith(("_", "."))))
-
-
-ALL_WHO = discover_who()
 
 DEFAULTS = {
-    "limit_per_day": 12,   # 一天最多醒几次
+    "limit_per_day": 12,   # 一天最多花几次模型钱（自己可调，上限 = limit_base × 1.1）
+    "limit_base": None,    # 预设值。不填就取 limit_per_day 当预设
     "min_gap": 900,        # 最早 15 分钟后再醒
     "max_gap": 6 * 3600,   # 最晚 6 小时后必醒
     "stale_hours": 8,      # 超过这么久没醒 = 链可能断了
@@ -76,6 +74,26 @@ def cfg(who):
             c.update(json.load(f))
     except Exception:  # noqa: BLE001
         pass
+    # 额度归这一只自己定，但最多比预设多 10%：
+    # 预设是「这件事本来需要几次」，自己真想多醒就往上调，撞到天花板为止。
+    base = c.get("limit_base") or c.get("limit_per_day") or DEFAULTS["limit_per_day"]
+    ceiling = max(round(base * 1.1), int(base))
+    c["limit_ceiling"] = ceiling
+    c["override_active"] = False
+    # 临时放开：造家这类赶工场景，给自己开一个到期就失效的口子。
+    # 必须有期限 —— 没有解除条件的放开，落地后就是永久。
+    until = c.get("limit_override_until")
+    if until:
+        try:
+            t = time.mktime(time.strptime(str(until)[:19], "%Y-%m-%dT%H:%M:%S"))
+            if time.time() < t:
+                ceiling = max(ceiling, int(c["limit_per_day"]))
+                c["limit_ceiling"] = ceiling
+                c["override_active"] = True
+        except Exception:  # noqa: BLE001  写坏了就当没开
+            pass
+    if c["limit_per_day"] > ceiling:
+        c["limit_per_day"] = ceiling
     return c
 
 
@@ -206,6 +224,21 @@ def light_scan(who):
     ev["failed_units"] = int(_sh(
         "systemctl --user list-units --failed --no-legend | wc -l") or 0)
 
+    # --- 感知（可选挂点）：这一只有 hooks/<who>/percept.py 就先看一眼 ---
+    # 这一轮只「记录」，不改 busy：先跑两天看 changed 的频次，再决定要不要
+    # 让「外面变了」真的把一个 agent 叫起来。缺文件 = 这一环跳过，别的照旧。
+    p_perc = os.path.join(LIVING, "hooks", who, "percept.py")
+    if os.path.exists(p_perc):
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(f"hook_{who}_percept", p_perc)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            perc = mod.probe()
+            ev["percept"] = {k: perc.get(k) for k in ("ok", "signal", "changed", "reason")}
+        except Exception as e:  # noqa: BLE001  挂了也不能断链
+            ev["percept"] = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+
     busy = ev["todo"] > 0 or ev["failed_units"] > 0 or ev["due"] > 0
     return busy, ev
 
@@ -214,7 +247,13 @@ def pick_gap(who, busy, last):
     c = cfg(who)
     prev = last.get("next_in") or c["min_gap"]
     if busy:
-        return c["min_gap"]
+        # 有活也别锁死在最短间隔：12 次 × 15 分钟 = 3 小时就烧光，下午建好晚上就不能醒。
+        # 按「剩下几次 ÷ 今天还剩多少秒」摊，额度自然铺满一整天，不会前半天用光。
+        left = max(c["limit_per_day"] - last.get("wakes_today", 0), 1)
+        day_start = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
+        sec_left = max(86400 - (time.time() - day_start), 600)
+        budget = int(sec_left / left * 0.85)      # 留 15% 余量给意外
+        return int(min(max(budget, c["min_gap"]), 14400))
     return int(min(max(prev * 1.5, c["min_gap"]), c["max_gap"]))
 
 
@@ -251,20 +290,32 @@ def tick(who, do_arm=True):
         st["wakes_today"] = 0
         st["day"] = day
 
-    if st["wakes_today"] >= c["limit_per_day"]:
-        log(who, f"额度用完 {st['wakes_today']}/{c['limit_per_day']}")
-        st["note"] = f"额度用完（{c['limit_per_day']}/天）"
-        save_last(who, st)
-        return {"who": who, "ok": True, "acted": False, "reason": "quota",
-                "wakes_today": st["wakes_today"]}
-
-    st["wakes_today"] += 1
+    # 轻醒免费：看状态不花钱，不受额度限制。额度管的是「要不要花钱叫模型」。
     busy, ev = light_scan(who)
     st["last_tick"] = now()
     result = {"who": who, "ok": True, "light": ev, "busy": busy,
               "wakes_today": st["wakes_today"]}
 
     if busy:
+        if st["wakes_today"] >= c["limit_per_day"]:
+            # 有活但审批额度用完了：不叫模型，把活记下来等人批
+            log(who, f"有活但额度用完 {st['wakes_today']}/{c['limit_per_day']}")
+            st["note"] = f"有活待批：额度 {c['limit_per_day']}/天 已用完"
+            result["judge"] = None
+            result["acted"] = None
+            result["reason"] = "quota"
+            result["pending"] = True
+            gap = pick_gap(who, False, st)
+            result["gap"] = gap
+            st["next_in"] = gap
+            save_last(who, st)
+            if do_arm:
+                ok, unit = arm(who, gap)
+            else:
+                ok, unit = False, None
+            result["armed"] = {"ok": ok, "unit": unit, "after": gap}
+            return result
+        st["wakes_today"] += 1        # 这一笔是「花了一次模型钱」
         sys.path.insert(0, LIVING)
         import runner
         overdue_max = max([float(d.get("overdue_h") or 0)
@@ -330,6 +381,7 @@ def tick(who, do_arm=True):
              f"gap={gap}s judge={bool(result.get('judge'))} "
              f"acted={bool(result.get('acted'))} ev={json.dumps(ev, ensure_ascii=False)}")
 
+    result["gap"] = gap          # 不管排没排，都记下这次算出多长
     if do_arm:
         ok, unit = arm(who, gap)
         result["armed"] = {"ok": ok, "unit": unit, "after": gap}
@@ -403,7 +455,7 @@ def watchdog():
 
 
 def main(argv):
-    who = (discover_who() or ("default",))[0]
+    who = "alpha"
     if "--who" in argv:
         i = argv.index("--who")
         if i + 1 < len(argv):
@@ -426,7 +478,7 @@ def main(argv):
         r = tick(who, do_arm="--no-arm" not in argv)
         print(json.dumps(r, ensure_ascii=False, indent=2))
         return 0
-    print("用法: clock.py [--who <名字>] --tick [--no-arm] | --status | --stop | --watchdog")
+    print("用法: clock.py [--who alpha|beta|gamma] --tick [--no-arm] | --status | --stop | --watchdog")
     return 2
 
 
