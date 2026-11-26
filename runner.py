@@ -31,8 +31,8 @@ import urllib.request
 LIVING = os.path.expanduser(os.environ.get("LIVING_HOME") or "~/living")
 API = "https://api.deepseek.com/v1/chat/completions"
 MODEL = "deepseek-chat"
-MAX_TURNS = 150         # 一次醒能连续用几轮（hermes 那边也是 150）。扫描不占这个数，
-                        # 所以它衡量的是「动手次数」，不是「看了多少次」
+MAX_TURNS = None        # 不设轮数上限：活干完为止，计划表里的轮数只是估算不是配额
+STALL_ROUNDS = 10       # 熔断只认空转：连续这么多轮没有任何动手动作，就是在打转，停
 CMD_TIMEOUT = 60
 
 TOOLS = [{
@@ -341,7 +341,7 @@ def save_session(who, record):
     return path
 
 
-PLAN_TURNS = 40         # 出计划阶段的预算。扫描不计轮，所以这 40 轮全是纯思考
+PLAN_TURNS = None       # 出计划阶段同样不设上限；情况看清楚它自然会停
 MIN_BLOCK_TURNS = 4     # 单块预算下限
 
 PLAN_RULES = """先别动手。做两件事：
@@ -351,11 +351,12 @@ PLAN_RULES = """先别动手。做两件事：
 
 计划表格式（只输出这个 JSON，不要别的话）：
 
-{"blocks": [{"title": "块的短名", "turns": 3, "detail": "这块要做什么，做完怎么算完"}]}
+{"estimate": 12, "blocks": [{"title": "块的短名", "turns": 3, "detail": "这块要做什么，做完怎么算完"}]}
 
 规矩：
+- estimate 是整件事大概几轮，就是个估算不是配额，超了照做
 - 每块要能独立验收，不能是「看一眼」这种侦察
-- turns 只估动手的轮数，按「实际要做几个动作」数，别乐观：一轮 = 一次调用
+- turns 只估动手的轮数，按「实际要做几个动作」数，别乐观
 - 块数 8 个以内，多了说明拆太碎
 - 拆完就停，别直接开工"""
 
@@ -388,12 +389,25 @@ def _parse_plan(text):
     return clean[:8]
 
 
-def _run_turns(who, key, tools, messages, limit, verbose=True):
-    """一轮一轮跑到收敛或撞顶。扫描不占预算 —— 侦察免费，动手才花钱。"""
+def _plan_estimate(text, blocks):
+    """计划表里报的总轮数估算。它没报就按各块加总。"""
+    m = re.search(r'"estimate"\s*:\s*(\d+)', text or "")
+    if m:
+        return int(m.group(1))
+    return sum(b["turns"] for b in blocks)
+
+
+def _run_turns(who, key, tools, messages, limit=None, verbose=True):
+    """一轮一轮跑到它自己收敛。
+
+    limit=None → 不设上限，干完为止。
+    另一种熔断更贴近真实：连续 STALL_ROUNDS 轮只有侦察没有动手，就是在打转。
+    """
     comp = load_hook(who, "compress")
     t0 = time.time()
     turns = 0
-    while turns < limit:
+    idle = 0
+    while limit is None or turns < limit:
         turns += 1
         if comp and hasattr(comp, "compact"):
             try:
@@ -424,7 +438,15 @@ def _run_turns(who, key, tools, messages, limit, verbose=True):
                              "content": json.dumps(result, ensure_ascii=False)[:6000]})
         if scan_only:
             turns -= 1
-    return {"ok": False, "reason": "max_turns", "turns": limit,
+            idle += 1
+            if idle >= STALL_ROUNDS:
+                return {"ok": False, "reason": "stalled", "turns": turns,
+                        "idle": idle, "ms": int((time.time() - t0) * 1000),
+                        "detail": f"连续 {idle} 轮只在看没动手，像在打转",
+                        "messages": messages}
+            continue
+        idle = 0
+    return {"ok": False, "reason": "max_turns", "turns": turns,
             "ms": int((time.time() - t0) * 1000), "messages": messages}
 
 
@@ -432,8 +454,13 @@ def _wrap_up(who, task, r):
     """统一收尾：落 journal、存 session、抛掉 messages 再交回去。"""
     reason = r.get("reason") or "ok"
     turns = r.get("turns") or 0
+    # ok/reason 必须进 session：不然事后看不出这次是跑完了还是撞了墙
     common = {"who": who, "task": task, "turns": turns,
+              "ok": r.get("ok"), "reason": r.get("reason"),
               "messages": r.get("messages") or [], "ms": r.get("ms") or 0}
+    for k in ("estimate", "over_budget"):
+        if r.get(k) is not None:
+            common[k] = r[k]
     if r.get("plan"):
         common["plan"] = r["plan"]
     if r.get("blocks"):
@@ -490,8 +517,8 @@ def ask(who, task, verbose=True, tools=None, max_turns=None, plan=False):
         budget = max(MIN_BLOCK_TURNS, math.ceil(b["turns"] * 1.1))
         hist.append({"role": "user",
                      "content": f"第 {i}/{len(blocks)} 块：{b['title']}\n\n{b['detail']}\n\n"
-                                f"预算 {budget} 轮（看东西不计入）。做完这块就停，别抢下一块。"})
-        r = _run_turns(who, key, tools, hist, budget, verbose)
+                                f"大概 {budget} 轮能干完（看东西不计入）。做完这块就停。"})
+        r = _run_turns(who, key, tools, hist, None, verbose)
         done.append({"i": i, "title": b["title"], "plan_turns": b["turns"],
                      "budget": budget, "used": r["turns"], "ok": r["ok"],
                      "reason": r.get("reason"), "answer": (r.get("answer") or "")[:2000]})
@@ -513,6 +540,7 @@ def ask(who, task, verbose=True, tools=None, max_turns=None, plan=False):
         "plan": [{"title": b["title"], "turns": b["turns"]} for b in blocks],
         "blocks": done,
         "over_budget": over,
+        "estimate": _plan_estimate(pr.get("answer") or "", blocks),
         "ms": pr.get("ms", 0),
         "messages": hist,
     })
