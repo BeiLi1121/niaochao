@@ -4,9 +4,9 @@
 一条链，不是定时器：每次醒来自己决定下一次什么时候醒。
 三只各用各的，状态、额度、待办、unit 名全部按 who 分开。
 
-    python3 ~/living/clock.py --who alpha --tick
-    python3 ~/living/clock.py --who beta --status
-    python3 ~/living/clock.py --who gamma --stop
+    python3 ~/living/clock.py --who qixi --tick
+    python3 ~/living/clock.py --who zhi --status
+    python3 ~/living/clock.py --who hatchling --stop
     python3 ~/living/clock.py --watchdog        # 保险，一次看所有接过钟的
 
 三级醒：
@@ -27,7 +27,7 @@ LIVING = os.path.expanduser(os.environ.get("LIVING_HOME") or "~/living")
 PY = "/usr/bin/python3"
 SELF = os.path.abspath(__file__)
 def discover_who():
-    """谁存在看 personas/ 目录，不写死名字 —— 拷到别的机器也能用。"""
+    """谁存在看 personas/ 目录，不写死名字 —— 换机器、加实例都不用改代码。"""
     d = os.path.join(LIVING, "personas")
     try:
         return tuple(sorted(n for n in os.listdir(d)
@@ -280,6 +280,24 @@ def _refresh_conversation():
         pass
 
 
+def _finish(who, st, result, gap, do_arm, line=None):
+    """收尾：落地、写日志、排下一枪。
+
+    三条出口（额度用完 / 有活做完 / 没活）都走这里 —— 以前各写一遍，
+    改一处就得记住另外两处。
+    """
+    st["next_in"] = gap
+    save_last(who, st)
+    log(who, line or f"tick gap={gap}s")
+    result["gap"] = gap
+    if do_arm:
+        ok, unit = arm(who, gap)
+        result["armed"] = {"ok": ok, "unit": unit, "after": gap}
+    else:
+        result["armed"] = None
+    return result
+
+
 def tick(who, do_arm=True):
     c = cfg(who)
     os.makedirs(state_dir(who), exist_ok=True)
@@ -299,22 +317,11 @@ def tick(who, do_arm=True):
     if busy:
         if st["wakes_today"] >= c["limit_per_day"]:
             # 有活但审批额度用完了：不叫模型，把活记下来等人批
-            log(who, f"有活但额度用完 {st['wakes_today']}/{c['limit_per_day']}")
             st["note"] = f"有活待批：额度 {c['limit_per_day']}/天 已用完"
-            result["judge"] = None
-            result["acted"] = None
-            result["reason"] = "quota"
-            result["pending"] = True
-            gap = pick_gap(who, False, st)
-            result["gap"] = gap
-            st["next_in"] = gap
-            save_last(who, st)
-            if do_arm:
-                ok, unit = arm(who, gap)
-            else:
-                ok, unit = False, None
-            result["armed"] = {"ok": ok, "unit": unit, "after": gap}
-            return result
+            result.update(judge=None, acted=None, reason="quota", pending=True)
+            return _finish(
+                who, st, result, pick_gap(who, False, st), do_arm,
+                line=f"有活但额度用完 {st['wakes_today']}/{c['limit_per_day']}")
         st["wakes_today"] += 1        # 这一笔是「花了一次模型钱」
         sys.path.insert(0, LIVING)
         import runner
@@ -375,19 +382,11 @@ def tick(who, do_arm=True):
         st["note"] = "轻醒：没事"
         gap = pick_gap(who, False, st)
 
-    st["next_in"] = gap
-    save_last(who, st)
-    log(who, f"tick busy={busy} wakes={st['wakes_today']}/{c['limit_per_day']} "
-             f"gap={gap}s judge={bool(result.get('judge'))} "
-             f"acted={bool(result.get('acted'))} ev={json.dumps(ev, ensure_ascii=False)}")
-
-    result["gap"] = gap          # 不管排没排，都记下这次算出多长
-    if do_arm:
-        ok, unit = arm(who, gap)
-        result["armed"] = {"ok": ok, "unit": unit, "after": gap}
-    else:
-        result["armed"] = None
-    return result
+    return _finish(
+        who, st, result, gap, do_arm,
+        line=(f"tick busy={busy} wakes={st['wakes_today']}/{c['limit_per_day']} "
+              f"gap={gap}s judge={bool(result.get('judge'))} "
+              f"acted={bool(result.get('acted'))} ev={json.dumps(ev, ensure_ascii=False)}"))
 
 
 def status(who):
@@ -455,7 +454,7 @@ def watchdog():
 
 
 def main(argv):
-    who = "alpha"
+    who = "qixi"
     if "--who" in argv:
         i = argv.index("--who")
         if i + 1 < len(argv):
@@ -478,7 +477,7 @@ def main(argv):
         r = tick(who, do_arm="--no-arm" not in argv)
         print(json.dumps(r, ensure_ascii=False, indent=2))
         return 0
-    print("用法: clock.py [--who alpha|beta|gamma] --tick [--no-arm] | --status | --stop | --watchdog")
+    print("用法: clock.py [--who qixi|zhi|hatchling] --tick [--no-arm] | --status | --stop | --watchdog")
     return 2
 
 

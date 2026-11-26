@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """家 · 最小执行器（三只共用）
 
-    python3 ~/living/runner.py --who alpha "看一下磁盘占用"
-    python3 ~/living/runner.py --who beta --selftest
-    python3 ~/living/runner.py --who gamma --ask "只回一个字：好"
+    python3 ~/living/runner.py --who qixi "看一下磁盘占用"
+    python3 ~/living/runner.py --who zhi --selftest
+    python3 ~/living/runner.py --who hatchling --ask "只回一个字：好"
 
 它做的事：
     1. 读 ~/living/personas/<who>/ 的 soul / memory / user —— 我是谁
@@ -134,7 +134,7 @@ def system_prompt(who, p):
     if soul:
         parts.append(soul)
     if usr:
-        parts.append("\n\n# 关于用户\n" + usr)
+        parts.append("\n\n# 关于北离\n" + usr)
     if mem:
         parts.append("\n\n# 我的长期笔记\n" + mem)
     parts.append(
@@ -146,7 +146,7 @@ def system_prompt(who, p):
         f"  skill(query/name) — 一百多条技能：别人写好的做法、踩过的坑、现成命令。要做某类活之前先搜。\n"
         f"  run(command)  — 在本机执行 shell 命令，用来看真实状态。\n"
         f"\n# 记忆怎么读\n"
-        f"上面已经带着三份：soul（我是谁）、用户档案（关于用户）、我的长期笔记。\n"
+        f"上面已经带着三份：soul（我是谁）、用户档案（关于北离）、我的长期笔记。\n"
         f"**那是最新最准的一份，回答前先读它**。recall 是补充，用来找「笔记里没展开、但事实库记过」的细节。\n"
         f"两份可能不同步：笔记是后来手写的，事实库是当时的记录。冲突时以笔记为准。\n"
         f"不要用 run 去翻 ~/.hermes/ 里找记忆，那是老宅，你已经搬出来了。\n"
@@ -197,6 +197,51 @@ def _hook_tools(who):
     extra = getattr(mod, "TOOLS", None) or []
     fn = getattr(mod, "call", None)
     return list(extra), fn
+
+
+def _t_run(args):
+    return run_cmd(args.get("command", ""))
+
+
+def _t_recall(args):
+    import memory as _mem
+    hits = _mem.search(args.get("query", ""), int(args.get("limit") or 6))
+    return {"exit_code": 0, "stdout": json.dumps(hits, ensure_ascii=False), "stderr": ""}
+
+
+def _t_skill(args):
+    import skills_index as _sk
+    if args.get("name"):
+        out = _sk.read(args["name"], bool(args.get("full")))
+    else:
+        out = _sk.search(args.get("query", ""), int(args.get("limit") or 6))
+    ok = out.get("ok")
+    return {"exit_code": 0 if ok else 1,
+            "stdout": json.dumps(out, ensure_ascii=False),
+            "stderr": "" if ok else str(out.get("reason"))}
+
+
+BUILTIN = {"run": _t_run, "recall": _t_recall, "skill": _t_skill}
+
+
+def _dispatch(who, name, args):
+    """工具分派：内建 → 挂点 → 没有。
+
+    一张表查下去，异常只在出口兜一次 —— 以前每个分支各写一遍 try/except，
+    加第四个工具就得再抄三行。
+    """
+    impl = BUILTIN.get(name)
+    if impl is None:
+        extra, fn = _hook_tools(who)
+        if fn and name in {t.get("function", {}).get("name") for t in extra}:
+            impl = lambda a: fn(name, a)  # noqa: E731
+    if impl is None:
+        return {"exit_code": -1, "stdout": "", "stderr": f"没有工具 {name}"}
+    try:
+        return impl(args)
+    except Exception as e:  # noqa: BLE001
+        return {"exit_code": 1, "stdout": "",
+                "stderr": f"工具 {name} 出错: {type(e).__name__}: {e}"}
 
 
 def _tools_for(who):
@@ -286,43 +331,7 @@ def ask(who, task, verbose=True, tools=None, max_turns=None):
                 args = json.loads(fn.get("arguments") or "{}")
             except json.JSONDecodeError:
                 args = {}
-            if name == "run":
-                result = run_cmd(args.get("command", ""))
-            elif name == "recall":
-                try:
-                    import memory as _mem
-                    m = _mem.search(args.get("query", ""), int(args.get("limit") or 6))
-                    result = {"exit_code": 0, "stdout": json.dumps(m, ensure_ascii=False),
-                              "stderr": ""}
-                except Exception as e:  # noqa: BLE001
-                    result = {"exit_code": 1, "stdout": "",
-                              "stderr": f"记忆查询失败: {e}"}
-            elif name == "skill":
-                try:
-                    import skills_index as _sk
-                    if args.get("name"):
-                        out = _sk.read(args["name"], bool(args.get("full")))
-                    else:
-                        out = _sk.search(args.get("query", ""),
-                                         int(args.get("limit") or 6))
-                    result = {"exit_code": 0 if out.get("ok") else 1,
-                              "stdout": json.dumps(out, ensure_ascii=False),
-                              "stderr": "" if out.get("ok") else str(out.get("reason"))}
-                except Exception as e:  # noqa: BLE001
-                    result = {"exit_code": 1, "stdout": "",
-                              "stderr": f"技能查询失败: {e}"}
-            else:
-                _extra, _fn = _hook_tools(who)
-                _names = [_t.get("function", {}).get("name") for _t in _extra]
-                result = None
-                if _fn and name in _names:
-                    try:
-                        result = _fn(name, args)
-                    except Exception as e:  # noqa: BLE001
-                        result = {"exit_code": 1, "stdout": "",
-                                  "stderr": f"挂点工具出错: {type(e).__name__}: {e}"}
-                if result is None:
-                    result = {"exit_code": -1, "stdout": "", "stderr": f"没有工具 {name}"}
+            result = _dispatch(who, name, args)
             if verbose:
                 shown = args.get("command") or args.get("query") or name
                 print(f"[tool] {shown} -> exit {result['exit_code']}", flush=True)
@@ -357,7 +366,7 @@ def selftest(who):
 
 
 def main(argv):
-    who = "alpha"
+    who = "qixi"
     rest = []
     i = 1
     while i < len(argv):
@@ -372,7 +381,7 @@ def main(argv):
         return selftest(who)
     task = " ".join(a for a in rest if not a.startswith("--")).strip()
     if not task:
-        print("用法: runner.py --who <alpha|beta|gamma> \"任务\" | --selftest")
+        print("用法: runner.py --who <qixi|zhi|hatchling> \"任务\" | --selftest")
         return 2
     r = ask(who, task)
     if not r.get("ok"):
