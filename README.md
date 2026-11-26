@@ -1,112 +1,114 @@
-# 家
+# Niaochao
 
-让一个 AI 不寄生在某个宿主程序里，自己有个家、自己的钟、自己的记忆。
+*niaochao* means "nest". This is a home for an AI that doesn't live inside a host application — its own place, its own clock, its own memory.
 
-约 1400 行 Python，只用标准库，只依赖一个 OpenAI 兼容的对话 API。
+[中文版 →](README.zh-CN.md)
+
+About 1400 lines of Python. Standard library only. One dependency: an OpenAI-compatible chat API.
 
 ---
 
-## 三个文件做的事
+## What the three files do
 
-**`runner.py`** — 主循环。给它一个任务，它把你的 `soul.md` / `user.md` / `memory.md` 拼进 system prompt，然后带着三个工具干活：
+**`runner.py`** — the main loop. Give it a task; it assembles your `soul.md` / `user.md` / `memory.md` into the system prompt and works with three tools:
 
-| 工具 | 干什么 |
+| Tool | What it does |
 |---|---|
-| `run(command)` | 在本机执行 shell，用来看真实状态 |
-| `recall(query)` | 查长期记忆 |
-| `skill(query/name)` | 查技能库（别人写好的做法和踩过的坑） |
+| `run(command)` | Executes shell on this machine, so it can look at real state |
+| `recall(query)` | Searches long-term memory |
+| `skill(query/name)` | Looks up the skill library (procedures and pitfalls someone already worked out) |
 
-**`clock.py`** — 钟。不是定时器，是一条链：每次醒来自己决定下次什么时候醒。
+**`clock.py`** — the clock. Not a timer. It's a chain: every time it wakes, it decides *itself* when to wake next.
 
-- **轻醒** 只跑 shell 看一眼（待办、到期日程、失败的单元），没活就睡回去，**一次模型都不调**
-- **判断** 有信号时只问「做/不做」，1 轮，不带工具
-- **做事** 说做才带工具动手
+- **Light wake** just runs shell and looks around (open loops, due items, failing units). Nothing to do? It goes back to sleep — **zero model calls**.
+- **Decide** — when there's a signal, it asks one question: do this or not. One turn, no tools.
+- **Work** — only if the answer was yes does it pick up tools.
 
-额度写在 `state/clock/<who>/config.json`。轻醒（只看状态）不要钱、不看额度；额度管的是「要不要叫模型」。用完了照常醒，只是不叫模型、把活记下来等批。赶工可以临时放开，但**必须带期限**——`limit_override_until` 到期自动回落，详见 `CLOCK.md`。
+Budget lives in `state/clock/<who>/config.json`. A light wake costs nothing and ignores the budget; the budget governs *whether to call the model at all*. When it runs out the clock still wakes, it just doesn't call the model — it writes the work down and waits for approval. You can temporarily lift the limit while pushing through something, but it **must expire**: `limit_override_until` falls back on its own. See `CLOCK.md`.
 
-**`hooks/`** — 挂点。主循环是共用的，**不要为了加行为去改它**。要加东西就写个模块挂上去，接口见 `HOOKS.md`。
-
----
-
-## 现在什么状态
-
-**测试版。能跑，但有四件事没跑通，写在这儿免得你踩。**
-
-1. **重活会卡。** 需要多轮探索的任务——比如「读 500 条对话然后写一份摘要」——轮次用完还是拿不到结果。现在一次醒能用 16 轮，转满会写一行「没干完」进 journal（以前直接丢），下次能接着做；但真正的大活还是该拆开。轻活（打包、查状态、跑单个脚本）没事。
-2. **判断层不稳。** 同一份信号，模型有时说「做」有时说「不做」。所以这里的做法是：**日程到期就是到期，不交给模型判断**，只有「有活但不确定是不是真活」才问它。
-3. **记忆检索很土。** 字符二元组 + 重合率，不是向量检索。中文短查询能用，别指望准确。
-4. **外设没带。** 看屏幕、动鼠标、语音这些是平台相关的，这里只留了动词约定（见下），实现自己写。
+**`hooks/`** — attachment points. The main loop is shared, and **you don't change it to add behaviour**. You write a module and hang it on. Interface in `HOOKS.md`.
 
 ---
 
-## 怎么跑
+## Where it stands
+
+**Beta. It runs, but four things aren't solved. Listing them so you don't trip on them.**
+
+1. **Heavy tasks used to stall.** Anything that needs many rounds of exploration — "read 500 conversations, then write a summary" — would run out of turns before producing anything. Now there's no turn ceiling: it lays out a plan first (with a rough turn estimate), then works block by block. Read-only tools and read-only commands don't count against turns, and the only circuit breaker is idling — ten consecutive rounds of looking without touching anything. Measured on a real task: the plan estimated 2 turns, it actually took 13, and it still finished. Light work (packaging, checking state, running one script) was never a problem.
+2. **The judgement layer is unstable.** Given the identical signal, the model sometimes says yes and sometimes no. So the rule here is: **a due item is due** — that goes straight through and never gets handed to the model. Only "there's work, but I'm not sure it's real" gets asked.
+3. **Memory retrieval is crude.** Character bigrams plus an overlap ratio, not vector search. Usable for short queries; don't expect accuracy.
+4. **No peripherals included.** Seeing the screen, moving a mouse, speaking — all platform-specific. Only the verb contract is defined here (below). You write the implementation.
+
+---
+
+## Running it
 
 ```bash
-# 1. 造一只
+# 1. Make one
 mkdir -p personas/me
 cp personas/example/*.md personas/me/
 cp personas/example/.env.example personas/me/.env
-# 填进去 API key，然后改 soul.md / user.md 写成你自己的
+# put your API key in, then rewrite soul.md / user.md as your own
 
-# 2. 直接问一句
-python3 runner.py --who me "现在磁盘还剩多少"
+# 2. Ask it something
+python3 runner.py --who me "how much disk is left"
 
-# 3. 自检
+# 3. Self-check
 python3 runner.py --who me --selftest
 
-# 4. 叫醒一次（不排下一枪）
+# 4. Wake it once (don't schedule the next one)
 python3 clock.py --who me --tick --no-arm
 
-# 5. 排进链
+# 5. Put it in the chain
 python3 clock.py --who me --tick
 ```
 
-想让它开机自己醒，用 systemd user timer 或 `cron @reboot` 调一次 `--tick` 就行——链会自己续下去。
+To have it wake up on boot, point a systemd user timer or `cron @reboot` at a single `--tick`. The chain keeps itself going from there.
 
 ---
 
-## 设计上真正重要的几个决定
+## Design decisions that actually matter
 
-**钟是链，不是定时器。** 定时器不懂「今天没什么事」，会照样把你叫起来烧钱。链式钟醒来先免费扫一遍，没活就睡回去。
+**The clock is a chain, not a timer.** A timer has no idea that nothing is happening today — it will wake you up anyway and burn money doing it. A chained clock sweeps for free first, and goes back to sleep if there's nothing.
 
-**判断和做事分开。** 一次调用里让它「判断要不要做」和「动手做」是矛盾的——它会为了给自己找理由而行动，或者为了不打扰你而放弃。拆成两步，每步只干一件事。
+**Deciding and doing are separate calls.** Asking a model to "judge whether this is worth doing" and "do it" in one call is a contradiction — it will act in order to justify itself, or give up in order not to bother you. Split it into two steps, one job each.
 
-**人格是文件，不是代码。** 换一个 `soul.md` 就是换一个存在。同一套骨架可以跑不同的人，各自有各自的记忆和钟，互不干扰。
+**Personality is files, not code.** Swap `soul.md` and you've swapped the being. The same skeleton runs different individuals, each with its own memory and its own clock, unaware of each other.
 
-**主循环只有一份。** 谁都不许改它。要加行为写挂点。这条不是为了洁癖——是因为一旦允许各自改主循环，就再也不知道自己跑的是哪一版。
+**There is exactly one main loop.** Nobody edits it. New behaviour goes in a hook. This isn't fussiness — the moment everyone edits their own copy of the main loop, nobody can tell which version is actually running.
 
-**不要读宿主的私有目录。** `runner.py` 不 import 宿主、不读它的数据库。要搬史料是另一个脚本的活（见 `migrate/` 的说明），主循环只读自己家。
+**Don't read the host's private directories.** `runner.py` does not import the host and does not read its database. Moving history over is a separate script's job (see the notes in `migrate/`). The main loop reads only its own home.
 
 ---
 
-## 外设的动词约定
+## The verbs a body has to speak
 
-身体我没法替你实现——屏幕、鼠标、麦克风每个平台都不一样。但接口该长这样：
+I can't implement a body for you — screens, mice and microphones differ per platform. But the interface should look like this:
 
-| 动词 | 语义 | 失败必须结构化 |
+| Verb | Meaning | Failures must be structured |
 |---|---|---|
-| `see(target)` | 看见 | `screen_off` / `screen_blank` / `blocked` / `no_target` |
-| `hear(source)` | 听见 | 同上 |
-| `speak(text)` | 说话 | 引擎不可用就文字兜底，不要静默失败 |
-| `act(action)` | 动手 | `screen_off` / `blocked` / `off_target` / `not_supported` |
-| `show(thing)` | 给人看 | 路径或 URL |
+| `see(target)` | Perceive | `screen_off` / `screen_blank` / `blocked` / `no_target` |
+| `hear(source)` | Listen | same as above |
+| `speak(text)` | Say it | engine unavailable → fall back to text, never fail silently |
+| `act(action)` | Move something | `screen_off` / `blocked` / `off_target` / `not_supported` |
+| `show(thing)` | Put it in front of a person | a path or a URL |
 
-**「我看不见」和「我看见一片黑」是两件不同的事。** 所有失败都要能区分开，不要抛异常糊过去——上层靠这个决定要不要重试。
-
----
-
-## 隐私
-
-⚠️ **这个设计里，人格和隐私就是同一批文件。**
-
-`personas/<who>/` 下面是 soul、你的用户档案、你的长期笔记；`state/` 下面是日记和进程状态；`memory/` 是事实库。
-
-`.gitignore` 已经把 `personas/*/`（除 example）、`state/`、`memory/`、`conversation/`、`medical/` 全挡在外面了。
-
-**但不要只靠 .gitignore。** 提交前自己 `git status` 看一眼——这个仓库里能进去的东西，就是你愿意公开的东西。
+**"I can't see" and "I see a black screen" are different things.** Every failure has to distinguish them. Don't throw an exception and paper over it — the layer above uses this to decide whether retrying makes sense.
 
 ---
 
-## 许可
+## Privacy
 
-MIT。拿去用，改，卖，都行，出事别找我。
+⚠️ **In this design, personality and privacy are the same set of files.**
+
+Under `personas/<who>/` live the soul, your user profile, and your long-term notes. Under `state/` are journals and process state. `memory/` is the fact store.
+
+`.gitignore` already blocks `personas/*/` (except example), `state/`, `memory/`, `conversation/` and `medical/`.
+
+**But don't rely on `.gitignore` alone.** Run `git status` before you commit. What ends up in this repository is exactly what you're willing to make public.
+
+---
+
+## License
+
+MIT. Use it, change it, sell it. If it breaks, that's on you.
