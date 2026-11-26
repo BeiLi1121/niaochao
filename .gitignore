@@ -1,0 +1,21 @@
+# 除了 example，每个人格都是你自己的，别提交
+personas/*
+!personas/example/
+
+# 运行产生的所有东西
+state/
+memory/
+conversation/
+medical/
+skills/
+logs/
+*.tar.gz
+
+# 密钥
+.env
+**/.env
+
+# 垃圾
+__pycache__/
+*.pyc
+.DS_Store
