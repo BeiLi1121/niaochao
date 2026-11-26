@@ -1,4 +1,4 @@
-# Niaochao
+# Living — A Model-Agnostic Runtime for Persistent Autonomous Agents
 
 *niaochao* means "nest". This is a home for an AI that doesn't live inside a host application — its own place, its own clock, its own memory.
 
