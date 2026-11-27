@@ -39,7 +39,7 @@ content 长度之和，非字符串的 content 记 0）：
     L2 后 > 20000   → L3（正常轮次到不了，兜底）
 
 为什么是 16000：DeepSeek-chat 的窗口 64k token，中文大致 1 字 ≈ 1 token
-上下浮。人格 + 用户档案 + 长期笔记全在 system 里，有的那份就有四万多字
+上下浮。人格 + 用户档案 + 长期笔记全在 system 里，example 那份就有四万多字
 （≈ 30k+ token），system 又不能动，所以留给历史的余量本来就不多。
 16000 字历史最坏算 16k token，加上 system 和本轮输出还留得出空间；
 再往上就比较像在赌 tokenizer 的具体切法了。
