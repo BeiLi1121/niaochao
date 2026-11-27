@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""家 · 最小执行器（三只共用）
+"""家 · 最小执行器（各实例共用）
 
-    python3 ~/living/runner.py --who alpha "看一下磁盘占用"
-    python3 ~/living/runner.py --who beta --selftest
-    python3 ~/living/runner.py --who gamma --ask "只回一个字：好"
+    python3 ~/living/runner.py --who example "看一下磁盘占用"
+    python3 ~/living/runner.py --who example --selftest
+    python3 ~/living/runner.py --who example --ask "只回一个字：好"
 
 它做的事：
     1. 读 ~/living/personas/<who>/ 的 soul / memory / user —— 我是谁
@@ -30,7 +30,7 @@ import urllib.request
 
 LIVING = os.path.expanduser(os.environ.get("LIVING_HOME") or "~/living")
 API = "https://api.deepseek.com/v1/chat/completions"
-MODEL = "deepseek-chat"
+MODEL = "deepseek-flash"
 MAX_TURNS = None        # 不设轮数上限：活干完为止，计划表里的轮数只是估算不是配额
 STALL_ROUNDS = 10       # 熔断只认空转：连续这么多轮没有任何动手动作，就是在打转，停
 CMD_TIMEOUT = 60
@@ -102,11 +102,11 @@ def load_hook(who, name):
     """从 ~/living/hooks/<who>/<name>.py 加载一个挂点模块。
 
     没有就返回 None —— 挂点是可选的，缺了主循环照跑。
-    这是为了让三只各自补自己那一块，谁也不改 runner.py。
+    这是为了让各实例各自补自己那一块，谁也不改 runner.py。
     """
     path = os.path.join(paths(who)["hooks"], name + ".py")
     if not os.path.exists(path):
-        # 共用挂点：三只同一份实现（比如压缩）
+        # 共用挂点：所有实例同一份实现（比如压缩）
         path = os.path.join(LIVING, "hooks", "_shared", name + ".py")
     if not os.path.exists(path):
         return None
@@ -129,6 +129,22 @@ def load_key(p):
     return ""
 
 
+CONV_DIRS = {
+    # 谁写根目录的 conversation/*.md，就在这儿登记；没登记的默认 conversation/<who>/。
+    # "example": "~/living/conversation",
+}
+
+
+def _conv_dir(who):
+    """这只的对话原文在哪。
+
+    每条线各归各的写者，互不覆盖：根目录 conversation/*.md 归默认那只，
+    其余各写在 conversation/<who>/ 下。以前 prompt 对所有实例都说同一个
+    路径，结果读到的是别人的对话。
+    """
+    return CONV_DIRS.get(who, f"~/living/conversation/{who}")
+
+
 def system_prompt(who, p):
     parts = []
     soul = _read(p["soul"])
@@ -144,10 +160,12 @@ def system_prompt(who, p):
         f"\n\n# 运行环境\n"
         f"你是 {who}，现在跑在自己家的最小执行器上，不是 hermes。\n"
         f"工作目录 {os.path.expanduser('~')}，系统 Linux(WSL)。\n"
-        f"\n你有三个工具：\n"
+        f"\n你的工具名以实际提供给你的为准（各只挂点不同，别照这份背）：\n"
         f"  recall(query) — 查你的长期记忆（两千多条事实）。要回忆「过去发生过什么」先用它。\n"
         f"  skill(query/name) — 一百多条技能：别人写好的做法、踩过的坑、现成命令。要做某类活之前先搜。\n"
         f"  run(command)  — 在本机执行 shell 命令，用来看真实状态。\n"
+        f"  挂点还能加 body（看/听/显形/动手）、remember（写自己的笔记）、say（主动发消息）。\n"
+        f"  不要凭这份清单说「我只有三个工具」——先看请求里实际挂了几件。\n"
         f"\n# 记忆怎么读\n"
         f"上面已经带着三份：soul（我是谁）、用户档案（关于用户）、我的长期笔记。\n"
         f"**那是最新最准的一份，回答前先读它**。recall 是补充，用来找「笔记里没展开、但事实库记过」的细节。\n"
@@ -155,9 +173,11 @@ def system_prompt(who, p):
         f"不要用 run 去翻 ~/.hermes/ 里找记忆，那是老宅，你已经搬出来了。\n"
         f"不要跑 find / 这种全盘搜索，慢且没用。\n"
         f"\n# 今天的对话在哪\n"
-        f"~/living/conversation/YYYY-MM-DD.md 是对话原文（她说的、你说过的），每天自动刷新。\n"
+        f"{_conv_dir(who)}/YYYY-MM-DD.md 是对话原文（她说的、你说过的），每天自动刷新。\n"
         f"要写病情摘要、日记、复盘，先打开当天的 md 看一眼，不要凭空猜今天发生过什么。\n"
-        f"\n回答用中文，不加句号，句间用逗号。"
+        f"\n回答用中文，不加句号，句间用逗号。\n"
+        f"聊天窗口里像人说话：一句话一行，说完就换行，不要把三件事塞进一段；段落之间空一行；先给结论，短句，句间用逗号。\n"
+        f"不分点、不用列表符号、不写小标题，不把查的过程倒出来。不用「收到」这类确认话；一律简体，不用繁体。这条优先于 SOUL 里的「不省字」。\n"
     )
     return "".join(parts)
 
@@ -206,9 +226,14 @@ def _t_run(args):
     return run_cmd(args.get("command", ""))
 
 
-def _t_recall(args):
+def _t_recall(args, who=None):
+    """查事实库。**必须带 who** —— 一人一份，不传就查不到自己那份。
+
+    2026-11-26 前这里是所有实例共读一份 facts.jsonl，等于把所有人的东西
+    摊在公共路径上。现在 memory.py 按 who 分库，这里跟着分。
+    """
     import memory as _mem
-    hits = _mem.search(args.get("query", ""), int(args.get("limit") or 6))
+    hits = _mem.search(args.get("query", ""), int(args.get("limit") or 6), who)
     return {"exit_code": 0, "stdout": json.dumps(hits, ensure_ascii=False), "stderr": ""}
 
 
@@ -225,6 +250,10 @@ def _t_skill(args):
 
 
 BUILTIN = {"run": _t_run, "recall": _t_recall, "skill": _t_skill}
+
+# 要按 who 分库的工具。一张表标出来，加一个就加一行，
+# 不用在每个工具里各写一遍「我是谁」。
+NEEDS_WHO = frozenset({"recall"})
 
 # 侦察是免费的，动手才花钱。只读工具、只读命令都不计入轮数 ——
 # 否则「先看清楚再动手」会被预算逼成「没看清就瞎动」
@@ -295,7 +324,7 @@ def _dispatch(who, name, args):
     if impl is None:
         return {"exit_code": -1, "stdout": "", "stderr": f"没有工具 {name}"}
     try:
-        return impl(args)
+        return impl(args, who) if name in NEEDS_WHO else impl(args)
     except Exception as e:  # noqa: BLE001
         return {"exit_code": 1, "stdout": "",
                 "stderr": f"工具 {name} 出错: {type(e).__name__}: {e}"}
@@ -493,6 +522,21 @@ def ask(who, task, verbose=True, tools=None, max_turns=None, plan=False):
     if tools is None:
         tools = _tools_for(who)
     base = [{"role": "system", "content": system_prompt(who, p)}]
+
+    # --- prepare 挂点：把「最近发生过的」插到人格和本轮任务之间 ---
+    # 硬规矩靠结构保证，不靠挂点自觉：base 只吃返回值的**中间**，
+    # 所以挂点就算写坏、返回了别的东西，也改不动 messages[0]（人格）
+    # 和最后一条（本次 task）。返回值不是 list 或长度不够就整段丢掉。
+    # 只改 base 不只改 messages，是因为 --plan 那条支线是拿 base 重新拼的，
+    # 只喂 messages 的话历史只在计划轮看得见、动手轮看不见，正好反了。
+    prep = load_hook(who, "prepare")
+    if prep and hasattr(prep, "prepare"):
+        try:
+            _o = prep.prepare(who, task, base + [{"role": "user", "content": task}])
+            if isinstance(_o, list) and len(_o) >= 2:
+                base = [_o[0]] + list(_o[1:-1])
+        except Exception:  # noqa: BLE001  挂点坏了不能断链
+            pass
 
     if not plan:
         return _wrap_up(who, task, _run_turns(

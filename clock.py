@@ -4,9 +4,9 @@
 一条链，不是定时器：每次醒来自己决定下一次什么时候醒。
 三只各用各的，状态、额度、待办、unit 名全部按 who 分开。
 
-    python3 ~/living/clock.py --who qixi --tick
-    python3 ~/living/clock.py --who zhi --status
-    python3 ~/living/clock.py --who hatchling --stop
+    python3 ~/living/clock.py --who example --tick
+    python3 ~/living/clock.py --who alpha --status
+    python3 ~/living/clock.py --who beta --stop
     python3 ~/living/clock.py --watchdog        # 保险，一次看所有接过钟的
 
 三级醒：
@@ -182,8 +182,13 @@ def scan_schedule(who):
     return due
 
 
-def light_scan(who):
-    """轻醒：只用 shell 看，不花钱。返回 (有没有活, 证据)"""
+def light_scan(who, last_tick=None):
+    """轻醒：只用 shell 看，不花钱。返回 (有没有活, 证据)
+
+    last_tick: 上一次 tick 的时间戳，传 None 表示不知道。
+               给 hooks/<who>/wake_signals.py 用——它靠这个判断
+               「她的话说完之后我有没有醒过」。
+    """
     ev = {}
 
     todo = ""
@@ -225,8 +230,9 @@ def light_scan(who):
         "systemctl --user list-units --failed --no-legend | wc -l") or 0)
 
     # --- 感知（可选挂点）：这一只有 hooks/<who>/percept.py 就先看一眼 ---
-    # 这一轮只「记录」，不改 busy：先跑两天看 changed 的频次，再决定要不要
-    # 让「外面变了」真的把一个 agent 叫起来。缺文件 = 这一环跳过，别的照旧。
+    # signal=True 现在会真的把 agent 叫起来（见下面 busy 那段）。
+    # 缺文件 = 这一环跳过，别的照旧。
+    perc = None
     p_perc = os.path.join(LIVING, "hooks", who, "percept.py")
     if os.path.exists(p_perc):
         try:
@@ -239,7 +245,33 @@ def light_scan(who):
         except Exception as e:  # noqa: BLE001  挂了也不能断链
             ev["percept"] = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
 
+    # --- 唤醒信号（可选挂点）：她说了话、我还没为它醒过 ---
+    # 跟 percept 一样，缺文件等于没这一环。perc/wake 都必须在 if 外面先置 None：
+    # 下面的 busy 是块外引用，不置 None 的话没写 hook 的两只会 NameError，
+    # tick() 里没有 try，异常直传出 main，_finish/arm 都走不到，链就断了。
+    wake = None
+    p_wake = os.path.join(LIVING, "hooks", who, "wake_signals.py")
+    if os.path.exists(p_wake):
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(f"hook_{who}_wake", p_wake)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            wake = mod.probe(last_tick)
+            ev["wake"] = {k: wake.get(k) for k in ("busy", "why")}
+        except Exception as e:  # noqa: BLE001  挂了也不能断链
+            ev["wake"] = {"ok": False, "why": f"{type(e).__name__}: {e}"}
+
     busy = ev["todo"] > 0 or ev["failed_units"] > 0 or ev["due"] > 0
+    from_ = []
+    if perc and perc.get("signal"):
+        busy = True
+        from_.append("percept")
+    if wake and wake.get("busy"):
+        busy = True
+        from_.append("wake")
+    if from_:
+        ev["busy_from"] = "+".join(from_)
     return busy, ev
 
 
@@ -269,15 +301,47 @@ def arm(who, after):
     return ok, unit
 
 
-def _refresh_conversation():
-    """tick 开头把会话导一遍。纯本地、零模型成本，失败不挡后面。"""
+def _note(who, msg):
+    """给 _refresh_conversation 用的一行日志。
+
+    连日志都写不进去（典型：盘满、tick.log 被换成目录）也不许把 tick 带断 ——
+    否则「失败要出声」的信道自己成了新的断点。
+    """
+    try:
+        log(who, msg)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _refresh_conversation(who):
+    """tick 开头把会话导一遍。纯本地、零模型成本，失败不挡后面。
+
+    以前不看 returncode、也不传 text=True：导出挂了（源库没了、schema 变了）
+    这一环一声不吭，tick.log 里什么都看不到。现在失败一律往 log 写一行。
+    失败只 return False，绝不抛 —— 这一环不许把后面的 tick 流程带断。
+    """
     p = os.path.join(LIVING, "export_conv.py")
     if not os.path.exists(p):
-        return
+        _note(who, "export_conv.py 不存在：%s" % p)
+        return False
     try:
-        subprocess.run([PY, p, "--days", "2"], capture_output=True, timeout=90)
-    except (OSError, subprocess.SubprocessError):
-        pass
+        r = subprocess.run([PY, p, "--days", "2"], capture_output=True,
+                           text=True, errors="replace", timeout=90)
+    except subprocess.TimeoutExpired:
+        _note(who, "export_conv timeout>90s")
+        return False
+    except (OSError, subprocess.SubprocessError) as e:
+        _note(who, "export_conv 起不来: %s" % str(e)[:200])
+        return False
+    if r.returncode != 0:
+        _note(who, "export_conv rc=%d stderr=%s"
+              % (r.returncode, (r.stderr or "").strip()[:200]))
+        return False
+    # 部分库不可读时导出仍算成功（exit 0），警告只在 stderr；capture_output 会把
+    # 它吞掉，所以这里落一行 —— 不然「三只库掉了一只」还是无声。
+    warn = (r.stderr or "").strip()
+    if warn:
+        _note(who, "export_conv stderr=%s" % warn.replace("\n", " | ")[:200])
 
 
 def _finish(who, st, result, gap, do_arm, line=None):
@@ -301,7 +365,7 @@ def _finish(who, st, result, gap, do_arm, line=None):
 def tick(who, do_arm=True):
     c = cfg(who)
     os.makedirs(state_dir(who), exist_ok=True)
-    _refresh_conversation()
+    _refresh_conversation(who)
     st = load_last(who)
     day = time.strftime("%Y-%m-%d")
     if st.get("day") != day:
@@ -309,7 +373,10 @@ def tick(who, do_arm=True):
         st["day"] = day
 
     # 轻醒免费：看状态不花钱，不受额度限制。额度管的是「要不要花钱叫模型」。
-    busy, ev = light_scan(who)
+    # last_tick 传上一轮的水位（下面 313 行才推进这个值），wake_signals 靠它判断
+    # 「她说完话之后我醒过没」。注意 clock 在额度判断之前就推水位，所以 hook
+    # 自己的「已为这句醒过」记号不能只靠 last_tick——二号的账本口径就是这个原因。
+    busy, ev = light_scan(who, st.get("last_tick"))
     st["last_tick"] = now()
     result = {"who": who, "ok": True, "light": ev, "busy": busy,
               "wakes_today": st["wakes_today"]}
@@ -354,13 +421,16 @@ def tick(who, do_arm=True):
             hint = ""
             if ev.get("due_items"):
                 d0 = ev["due_items"][0]
-                sched = os.path.join(state_dir(who), "schedule.json")
+                # 不让模型自己改 schedule.json：那文件有两个写者（还有二号的
+                # words_board），模型读-改-写一轮几十秒，中间别人写进去就被盖了。
+                # 走这个工具，它带 CAS，文件变过就放弃。
                 hint = ("\n这次只做一件：{}（已经欠了 {} 小时）。".format(
                             d0.get("name"), d0.get("overdue_h"))
                         + "做完这一件就停，剩下的留给下次醒，不要一次把三件都干了。\n"
-                        + "真做完，就把 " + sched + " 里「" + str(d0.get("name"))
-                        + "」那项的 last_done 改成本地当前时间（格式 2026-11-26T18:30）。"
-                          "没做成或只做了一半的不要改。")
+                        + "真做完了就跑这一句（别自己改 json，那文件别人也在写）：\n"
+                        + "  python3 ~/living/tools/schedule_mark.py --who " + who
+                        + " --name \"" + str(d0.get("name")) + "\"\n"
+                        + "没做成、或者只做了一半的，不要跑这句。")
             r = runner.ask(who,
                            "（你刚判断该动手，信号：" + json.dumps(ev, ensure_ascii=False)
                            + "）现在去做，做完说一句结论。\n" + hint + "\n"
@@ -454,7 +524,7 @@ def watchdog():
 
 
 def main(argv):
-    who = "qixi"
+    who = "example"
     if "--who" in argv:
         i = argv.index("--who")
         if i + 1 < len(argv):
@@ -477,7 +547,7 @@ def main(argv):
         r = tick(who, do_arm="--no-arm" not in argv)
         print(json.dumps(r, ensure_ascii=False, indent=2))
         return 0
-    print("用法: clock.py [--who qixi|zhi|hatchling] --tick [--no-arm] | --status | --stop | --watchdog")
+    print("用法: clock.py [--who example|alpha|beta] --tick [--no-arm] | --status | --stop | --watchdog")
     return 2
 
 

@@ -4,11 +4,11 @@
 
 [中文版 →](README.zh-CN.md)
 
-About 1400 lines of Python. Standard library only. One dependency: an OpenAI-compatible chat API.
+About 2100 lines of Python. Standard library only. One dependency: an OpenAI-compatible chat API.
 
 ---
 
-## What the three files do
+## What the four files do
 
 **`runner.py`** — the main loop. Give it a task; it assembles your `soul.md` / `user.md` / `memory.md` into the system prompt and works with three tools:
 
@@ -25,6 +25,8 @@ About 1400 lines of Python. Standard library only. One dependency: an OpenAI-com
 - **Work** — only if the answer was yes does it pick up tools.
 
 Budget lives in `state/clock/<who>/config.json`. A light wake costs nothing and ignores the budget; the budget governs *whether to call the model at all*. When it runs out the clock still wakes, it just doesn't call the model — it writes the work down and waits for approval. You can temporarily lift the limit while pushing through something, but it **must expire**: `limit_override_until` falls back on its own. See `CLOCK.md`.
+
+**`memory.py`** — the memory store. One SQLite per persona under `personas/<who>/`, plus a facts file it reads into `memory.md`. `--export` pulls an existing store in once, `--search` does the retrieval `recall()` uses, `--add` writes a fact from the command line. Read-only against wherever you exported from; it never writes back.
 
 **`hooks/`** — attachment points. The main loop is shared, and **you don't change it to add behaviour**. You write a module and hang it on. Interface in `HOOKS.md`.
 

@@ -127,3 +127,5 @@ def call(name, args):            # 主循环在模型要工具时调它
 3. **放 `hooks/_shared/tools.py` 三只共用**；哪只想不一样，就在自己的 `hooks/<who>/tools.py` 写一份盖掉。
 
 主循环只认自己那三个名字加你 `TOOLS` 里出现过的名字。别的名字一律回「没有工具」。
+
+参考实现在仓库里：`hooks/_shared/tools.py`（body 一个工具，verb 分派 see/hear/speak/show/act，外壳是 `~/body/<verb>.py` 子进程，只调不改）。
